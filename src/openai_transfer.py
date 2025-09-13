@@ -10,21 +10,22 @@ from config import (
     DEFAULT_SAFETY_SETTINGS,
     get_base_model_name,
     get_thinking_budget,
+    is_search_model,
     should_include_thoughts,
     get_compatibility_mode_enabled
 )
 from log import log
 from .models import ChatCompletionRequest
 
-async def openai_request_to_gemini(openai_request: ChatCompletionRequest) -> Dict[str, Any]:
+async def openai_request_to_gemini_payload(openai_request: ChatCompletionRequest) -> Dict[str, Any]:
     """
-    将OpenAI聊天完成请求转换为Gemini格式
+    将OpenAI聊天完成请求直接转换为完整的Gemini API payload格式
     
     Args:
         openai_request: OpenAI格式请求对象
         
     Returns:
-        Gemini API格式的字典
+        完整的Gemini API payload，包含model和request字段
     """
     contents = []
     system_instructions = []
@@ -38,7 +39,6 @@ async def openai_request_to_gemini(openai_request: ChatCompletionRequest) -> Dic
     
     for message in openai_request.messages:
         role = message.role
-        log.debug(f"Processing message: role={role}, content={getattr(message, 'content', None)}, compatibility_mode={compatibility_mode}")
         
         # 处理系统消息
         if role == "system":
@@ -66,7 +66,7 @@ async def openai_request_to_gemini(openai_request: ChatCompletionRequest) -> Dic
         if role == "assistant":
             role = "model"
         
-        # 处理不同类型的内容（字符串 vs 部件列表）
+        # 处理普通内容
         if isinstance(message.content, list):
             parts = []
             for part in message.content:
@@ -89,12 +89,12 @@ async def openai_request_to_gemini(openai_request: ChatCompletionRequest) -> Dic
                         except ValueError:
                             continue
             contents.append({"role": role, "parts": parts})
-            log.debug(f"Added message to contents: role={role}, parts={parts}")
-        else:
+            # log.debug(f"Added message to contents: role={role}, parts={parts}")
+        elif message.content:
             # 简单文本内容
             contents.append({"role": role, "parts": [{"text": message.content}]})
-            log.debug(f"Added message to contents: role={role}, content={message.content}")
-    
+            # log.debug(f"Added message to contents: role={role}, content={message.content}")
+
     # 将OpenAI生成参数映射到Gemini格式
     generation_config = {}
     if openai_request.temperature is not None:
@@ -126,30 +126,40 @@ async def openai_request_to_gemini(openai_request: ChatCompletionRequest) -> Dic
     if not contents:
         contents.append({"role": "user", "parts": [{"text": "请根据系统指令回答。"}]})
     
-    # 构建请求负载
-    request_payload = {
+    # 构建请求数据
+    request_data = {
         "contents": contents,
         "generationConfig": generation_config,
         "safetySettings": DEFAULT_SAFETY_SETTINGS,
-        "model": get_base_model_name(openai_request.model)
     }
     
-    # 如果有系统消息且未启用兼容性模式，添加system_instruction
+    # 如果有系统消息且未启用兼容性模式，添加systemInstruction
     if system_instructions and not compatibility_mode:
         combined_system_instruction = "\n\n".join(system_instructions)
-        request_payload["system_instruction"] = combined_system_instruction
+        request_data["systemInstruction"] = {"parts": [{"text": combined_system_instruction}]}
     
     log.debug(f"Final request payload contents count: {len(contents)}, system_instruction: {bool(system_instructions and not compatibility_mode)}, compatibility_mode: {compatibility_mode}")
     
     # 为thinking模型添加thinking配置
     thinking_budget = get_thinking_budget(openai_request.model)
     if thinking_budget is not None:
-        request_payload["generationConfig"]["thinkingConfig"] = {
+        request_data["generationConfig"]["thinkingConfig"] = {
             "thinkingBudget": thinking_budget,
             "includeThoughts": should_include_thoughts(openai_request.model)
         }
     
-    return request_payload
+    # 为搜索模型添加Google Search工具
+    if is_search_model(openai_request.model):
+        request_data["tools"] = [{"googleSearch": {}}]
+
+    # 移除None值
+    request_data = {k: v for k, v in request_data.items() if v is not None}
+    
+    # 返回完整的Gemini API payload格式
+    return {
+        "model": get_base_model_name(openai_request.model),
+        "request": request_data
+    }
 
 def _extract_content_and_reasoning(parts: list) -> tuple:
     """从Gemini响应部件中提取内容和推理内容"""
@@ -157,14 +167,13 @@ def _extract_content_and_reasoning(parts: list) -> tuple:
     reasoning_content = ""
     
     for part in parts:
-        if not part.get("text"):
-            continue
-        
-        # 检查这个部件是否包含thinking tokens
-        if part.get("thought", False):
-            reasoning_content += part.get("text", "")
-        else:
-            content += part.get("text", "")
+        # 处理文本内容
+        if part.get("text"):
+            # 检查这个部件是否包含thinking tokens
+            if part.get("thought", False):
+                reasoning_content += part.get("text", "")
+            else:
+                content += part.get("text", "")
     
     return content, reasoning_content
 
@@ -172,7 +181,7 @@ def _build_message_with_reasoning(role: str, content: str, reasoning_content: st
     """构建包含可选推理内容的消息对象"""
     message = {
         "role": role,
-        "content": content,
+        "content": content
     }
     
     # 如果有thinking tokens，添加reasoning_content

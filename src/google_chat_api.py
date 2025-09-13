@@ -126,6 +126,9 @@ async def send_gemini_request(payload: dict, is_streaming: bool = False, credent
 
     # 预序列化payload，避免重试时重复序列化
     final_post_data = json.dumps(final_payload)
+    
+    # Debug日志：打印请求体结构
+    log.debug(f"Final request payload structure: {json.dumps(final_payload, ensure_ascii=False, indent=2)}")
 
     for attempt in range(max_retries + 1):
         try:
@@ -139,15 +142,22 @@ async def send_gemini_request(payload: dict, is_streaming: bool = False, credent
                     resp = await stream_ctx.__aenter__()
                     
                     if resp.status_code == 429:
-                        # 记录429错误
+                        # 记录429错误并获取响应内容
+                        response_content = ""
+                        try:
+                            content_bytes = await resp.aread()
+                            if isinstance(content_bytes, bytes):
+                                response_content = content_bytes.decode('utf-8', errors='ignore')
+                        except Exception as e:
+                            log.debug(f"[STREAMING] Failed to read 429 response content: {e}")
+                        
+                        # 显示详细的429错误信息
+                        if response_content:
+                            log.error(f"Google API returned status 429 (STREAMING). Response details: {response_content[:500]}")
+                        else:
+                            log.error("Google API returned status 429 (STREAMING) - quota exhausted, no response details available")
+                        
                         if credential_manager and current_file:
-                            response_content = ""
-                            try:
-                                content_bytes = await resp.aread()
-                                if isinstance(content_bytes, bytes):
-                                    response_content = content_bytes.decode('utf-8', errors='ignore')
-                            except Exception:
-                                pass
                             await credential_manager.record_api_call_result(current_file, False, 429)
                         
                         # 清理资源
@@ -183,6 +193,47 @@ async def send_gemini_request(payload: dict, is_streaming: bool = False, credent
                                 }
                                 yield f"data: {json.dumps(error_response)}\n\n"
                             return StreamingResponse(error_stream(), media_type="text/event-stream", status_code=429)
+                    elif resp.status_code != 200:
+                        # 处理其他非200状态码的错误
+                        response_content = ""
+                        try:
+                            content_bytes = await resp.aread()
+                            if isinstance(content_bytes, bytes):
+                                response_content = content_bytes.decode('utf-8', errors='ignore')
+                        except Exception as e:
+                            log.debug(f"[STREAMING] Failed to read error response content: {e}")
+                        
+                        # 显示详细的错误信息
+                        if response_content:
+                            log.error(f"Google API returned status {resp.status_code} (STREAMING). Response details: {response_content[:500]}")
+                        else:
+                            log.error(f"Google API returned status {resp.status_code} (STREAMING) - no response details available")
+                        
+                        # 记录API调用错误
+                        if credential_manager and current_file:
+                            await credential_manager.record_api_call_result(current_file, False, resp.status_code)
+                        
+                        # 清理资源
+                        try:
+                            await stream_ctx.__aexit__(None, None, None)
+                        except:
+                            pass
+                        await client.aclose()
+                        
+                        # 处理凭证轮换
+                        await _handle_api_error(credential_manager, resp.status_code, response_content)
+                        
+                        # 返回错误流
+                        async def error_stream():
+                            error_response = {
+                                "error": {
+                                    "message": f"API error: {resp.status_code}",
+                                    "type": "api_error", 
+                                    "code": resp.status_code
+                                }
+                            }
+                            yield f"data: {json.dumps(error_response)}\n\n"
+                        return StreamingResponse(error_stream(), media_type="text/event-stream", status_code=resp.status_code)
                     else:
                         # 成功响应，传递所有资源给流式处理函数管理
                         return _handle_streaming_response_managed(resp, stream_ctx, client, credential_manager, payload.get("model", ""), current_file)
@@ -427,72 +478,58 @@ async def _handle_non_streaming_response(resp, credential_manager: CredentialMan
         
         return _create_error_response(f"API error: {resp.status_code}", resp.status_code)
 
-def build_gemini_payload_from_openai(openai_payload: dict) -> dict:
-    """
-    Build a Gemini API payload from an OpenAI-transformed request.
-    """
-    model = openai_payload.get("model")
-    safety_settings = openai_payload.get("safetySettings", DEFAULT_SAFETY_SETTINGS)
-    
-    # 构建请求数据，直接使用扁平化结构
-    request_data = {
-        "contents": openai_payload.get("contents"),
-        "safetySettings": safety_settings,
-        "generationConfig": openai_payload.get("generationConfig", {}),
-    }
-    
-    # 添加系统指令（如果存在）
-    system_instruction = openai_payload.get("system_instruction")
-    if system_instruction:
-        if isinstance(system_instruction, str):
-            request_data["systemInstruction"] = {"parts": [{"text": system_instruction}]}
-        else:
-            request_data["systemInstruction"] = system_instruction
-    
-    # 添加其他可选字段
-    optional_fields = ["cachedContent", "tools", "toolConfig"]
-    for field in optional_fields:
-        value = openai_payload.get(field)
-        if value is not None:
-            request_data[field] = value
-    
-    # 移除None值
-    request_data = {k: v for k, v in request_data.items() if v is not None}
-    
-    return {
-        "model": model,
-        "request": request_data
-    }
-
-
 def build_gemini_payload_from_native(native_request: dict, model_from_path: str) -> dict:
     """
-    Build a Gemini API payload from a native Gemini request.
+    Build a Gemini API payload from a native Gemini request with full pass-through support.
     """
-    native_request["safetySettings"] = DEFAULT_SAFETY_SETTINGS
+    # 创建请求副本以避免修改原始数据
+    request_data = native_request.copy()
     
-    if "generationConfig" not in native_request:
-        native_request["generationConfig"] = {}
+    # 应用默认安全设置（如果未指定）
+    if "safetySettings" not in request_data:
+        request_data["safetySettings"] = DEFAULT_SAFETY_SETTINGS
     
-    if "thinkingConfig" not in native_request["generationConfig"]:
-        native_request["generationConfig"]["thinkingConfig"] = {}
+    # 确保generationConfig存在
+    if "generationConfig" not in request_data:
+        request_data["generationConfig"] = {}
     
-    # 配置thinking
-    thinking_budget = get_thinking_budget(model_from_path)
-    include_thoughts = should_include_thoughts(model_from_path)
+    generation_config = request_data["generationConfig"]
     
-    native_request["generationConfig"]["thinkingConfig"]["includeThoughts"] = include_thoughts
-    native_request["generationConfig"]["thinkingConfig"]["thinkingBudget"] = thinking_budget
+    # 配置thinking（如果未指定thinkingConfig）
+    if "thinkingConfig" not in generation_config:
+        generation_config["thinkingConfig"] = {}
     
-    # Add Google Search grounding for search models
+    thinking_config = generation_config["thinkingConfig"]
+    
+    # 只有在未明确设置时才应用默认thinking配置
+    if "includeThoughts" not in thinking_config:
+        thinking_config["includeThoughts"] = should_include_thoughts(model_from_path)
+    if "thinkingBudget" not in thinking_config:
+        thinking_config["thinkingBudget"] = get_thinking_budget(model_from_path)
+    
+    # 为搜索模型添加Google Search工具（如果未指定且没有functionDeclarations）
     if is_search_model(model_from_path):
-        if "tools" not in native_request:
-            native_request["tools"] = []
-        # Add googleSearch tool if not already present
-        if not any(tool.get("googleSearch") for tool in native_request["tools"]):
-            native_request["tools"].append({"googleSearch": {}})
+        if "tools" not in request_data:
+            request_data["tools"] = []
+        # 检查是否已有functionDeclarations或googleSearch工具
+        has_function_declarations = any(tool.get("functionDeclarations") for tool in request_data["tools"])
+        has_google_search = any(tool.get("googleSearch") for tool in request_data["tools"])
+        
+        # 只有在没有任何工具时才添加googleSearch，或者只有googleSearch工具时可以添加更多googleSearch
+        if not has_function_declarations and not has_google_search:
+            request_data["tools"].append({"googleSearch": {}})
+    
+    # 透传所有其他Gemini原生字段:
+    # - contents (必需)
+    # - systemInstruction (可选)
+    # - generationConfig (已处理)
+    # - safetySettings (已处理)  
+    # - tools (已处理)
+    # - toolConfig (透传)
+    # - cachedContent (透传)
+    # - 以及任何其他未知字段都会被透传
     
     return {
         "model": get_base_model_name(model_from_path),
-        "request": native_request
+        "request": request_data
     }

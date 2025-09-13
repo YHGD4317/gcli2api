@@ -4,14 +4,14 @@ Web路由模块 - 处理认证相关的HTTP请求和控制面板功能
 """
 import asyncio
 import datetime
-import glob
 import io
 import json
 import os
 import time
 import zipfile
 from collections import deque
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, HTTPException, Depends, File, UploadFile, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, Response
@@ -20,13 +20,14 @@ from pydantic import BaseModel
 from starlette.websockets import WebSocketState
 import toml
 import zipfile
+import httpx
 
 import config
 from log import log
 from .auth import (
     create_auth_url, get_auth_status,
     verify_password, generate_auth_token, verify_auth_token,
-    batch_upload_credentials, asyncio_complete_auth_flow, 
+    asyncio_complete_auth_flow, complete_auth_flow_from_callback_url,
     load_credentials_from_env, clear_env_credentials
 )
 from .credential_manager import CredentialManager
@@ -142,9 +143,16 @@ class LoginRequest(BaseModel):
 
 class AuthStartRequest(BaseModel):
     project_id: Optional[str] = None  # 现在是可选的
+    get_all_projects: Optional[bool] = False  # 是否为所有项目获取凭证
 
 class AuthCallbackRequest(BaseModel):
     project_id: Optional[str] = None  # 现在是可选的
+    get_all_projects: Optional[bool] = False  # 是否为所有项目获取凭证
+
+class AuthCallbackUrlRequest(BaseModel):
+    callback_url: str  # OAuth回调完整URL
+    project_id: Optional[str] = None  # 可选的项目ID
+    get_all_projects: Optional[bool] = False  # 是否为所有项目获取凭证
 
 class CredFileActionRequest(BaseModel):
     filename: str
@@ -237,23 +245,29 @@ async def login(request: LoginRequest):
 
 @router.post("/auth/start")
 async def start_auth(request: AuthStartRequest, token: str = Depends(verify_token)):
-    """开始认证流程，支持自动检测项目ID"""
+    """开始认证流程，支持自动检测项目ID和批量获取所有项目"""
     try:
-        # 如果没有提供项目ID，尝试自动检测
-        project_id = request.project_id
-        if not project_id:
-            log.info("用户未提供项目ID，后续将使用自动检测...")
+        # 检查是否为批量项目模式
+        if request.get_all_projects:
+            log.info("用户请求批量获取所有项目的凭证...")
+            project_id = None  # 批量模式下不指定单个项目ID
+        else:
+            # 如果没有提供项目ID，尝试自动检测
+            project_id = request.project_id
+            if not project_id:
+                log.info("用户未提供项目ID，后续将使用自动检测...")
         
         # 使用认证令牌作为用户会话标识
         user_session = token if token else None
-        result = await create_auth_url(project_id, user_session)
+        result = await create_auth_url(project_id, user_session, get_all_projects=request.get_all_projects)
         
         if result['success']:
             return JSONResponse(content={
                 "auth_url": result['auth_url'],
                 "state": result['state'],
                 "auto_project_detection": result.get('auto_project_detection', False),
-                "detected_project_id": result.get('detected_project_id')
+                "detected_project_id": result.get('detected_project_id'),
+                "get_all_projects": request.get_all_projects
             })
         else:
             raise HTTPException(status_code=500, detail=result['error'])
@@ -267,23 +281,32 @@ async def start_auth(request: AuthStartRequest, token: str = Depends(verify_toke
 
 @router.post("/auth/callback")
 async def auth_callback(request: AuthCallbackRequest, token: str = Depends(verify_token)):
-    """处理认证回调，支持自动检测项目ID"""
+    """处理认证回调，支持自动检测项目ID和批量获取所有项目"""
     try:
         # 项目ID现在是可选的，在回调处理中进行自动检测
         project_id = request.project_id
+        get_all_projects = request.get_all_projects
         
         # 使用认证令牌作为用户会话标识
         user_session = token if token else None
         # 异步等待OAuth回调完成
-        result = await asyncio_complete_auth_flow(project_id, user_session)
+        result = await asyncio_complete_auth_flow(project_id, user_session, get_all_projects=get_all_projects)
         
         if result['success']:
-            return JSONResponse(content={
-                "credentials": result['credentials'],
-                "file_path": result['file_path'],
-                "message": "认证成功，凭证已保存",
-                "auto_detected_project": result.get('auto_detected_project', False)
-            })
+            if get_all_projects and result.get('multiple_credentials'):
+                # 批量认证成功，返回多个凭证信息
+                return JSONResponse(content={
+                    "multiple_credentials": result['multiple_credentials'],
+                    "message": "批量认证成功，已为多个项目保存凭证"
+                })
+            else:
+                # 单项目认证成功
+                return JSONResponse(content={
+                    "credentials": result['credentials'],
+                    "file_path": result['file_path'],
+                    "message": "认证成功，凭证已保存",
+                    "auto_detected_project": result.get('auto_detected_project', False)
+                })
         else:
             # 如果需要手动项目ID或项目选择，在响应中标明
             if result.get('requires_manual_project_id'):
@@ -312,6 +335,65 @@ async def auth_callback(request: AuthCallbackRequest, token: str = Depends(verif
         raise
     except Exception as e:
         log.error(f"处理认证回调失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/auth/callback-url")
+async def auth_callback_url(request: AuthCallbackUrlRequest, token: str = Depends(verify_token)):
+    """从回调URL直接完成认证，支持批量获取所有项目"""
+    try:
+        # 验证URL格式
+        if not request.callback_url or not request.callback_url.startswith(('http://', 'https://')):
+            raise HTTPException(status_code=400, detail="请提供有效的回调URL")
+        
+        # 从回调URL完成认证
+        result = await complete_auth_flow_from_callback_url(
+            request.callback_url, 
+            request.project_id, 
+            get_all_projects=request.get_all_projects
+        )
+        
+        if result['success']:
+            if request.get_all_projects and result.get('multiple_credentials'):
+                # 批量认证成功，返回多个凭证信息
+                return JSONResponse(content={
+                    "multiple_credentials": result['multiple_credentials'],
+                    "message": "从回调URL批量认证成功，已为多个项目保存凭证"
+                })
+            else:
+                # 单项目认证成功
+                return JSONResponse(content={
+                    "credentials": result['credentials'],
+                    "file_path": result['file_path'],
+                    "message": "从回调URL认证成功，凭证已保存",
+                    "auto_detected_project": result.get('auto_detected_project', False)
+                })
+        else:
+            # 处理各种错误情况
+            if result.get('requires_manual_project_id'):
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": result['error'],
+                        "requires_manual_project_id": True
+                    }
+                )
+            elif result.get('requires_project_selection'):
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": result['error'],
+                        "requires_project_selection": True,
+                        "available_projects": result['available_projects']
+                    }
+                )
+            else:
+                raise HTTPException(status_code=400, detail=result['error'])
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error(f"从回调URL处理认证失败: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -430,18 +512,16 @@ async def upload_credentials(files: List[UploadFile] = File(...), token: str = D
         storage_adapter = await get_storage_adapter()
         
         # 分批处理大量文件以提高稳定性
-        batch_size = 50  # 每批处理50个文件
+        batch_size = 1000  # 每批处理1000个文件
         all_results = []
         total_success = 0
         
         for i in range(0, len(files_data), batch_size):
             batch_files = files_data[i:i + batch_size]
             
-            # 使用存储适配器上传凭证
-            batch_results = []
-            batch_uploaded_count = 0
-            
-            for file_data in batch_files:
+            # 使用并发处理提升文件上传性能
+            async def process_single_file(file_data):
+                """处理单个文件的并发函数"""
                 try:
                     filename = file_data['filename']
                     content_str = file_data['content']
@@ -475,32 +555,53 @@ async def upload_credentials(files: List[UploadFile] = File(...), token: str = D
                         except Exception as e:
                             log.warning(f"Failed to create default state for {filename}: {e}")
                         
-                        batch_uploaded_count += 1
-                        batch_results.append({
+                        log.debug(f"成功上传凭证文件: {filename}")
+                        return {
                             "filename": filename,
                             "status": "success",
                             "message": "上传成功"
-                        })
-                        log.info(f"成功上传凭证文件: {filename}")
+                        }
                     else:
-                        batch_results.append({
+                        return {
                             "filename": filename,
                             "status": "error",
                             "message": "存储失败"
-                        })
+                        }
                         
                 except json.JSONDecodeError as e:
-                    batch_results.append({
+                    return {
                         "filename": file_data['filename'],
                         "status": "error",
                         "message": f"JSON格式错误: {str(e)}"
-                    })
+                    }
                 except Exception as e:
-                    batch_results.append({
+                    return {
                         "filename": file_data['filename'],
                         "status": "error",
                         "message": f"处理失败: {str(e)}"
+                    }
+            
+            # 并发处理这一批文件
+            log.info(f"开始并发处理 {len(batch_files)} 个文件...")
+            concurrent_tasks = [process_single_file(file_data) for file_data in batch_files]
+            batch_results = await asyncio.gather(*concurrent_tasks, return_exceptions=True)
+            
+            # 处理异常结果
+            processed_results = []
+            batch_uploaded_count = 0
+            for result in batch_results:
+                if isinstance(result, Exception):
+                    processed_results.append({
+                        "filename": "unknown",
+                        "status": "error", 
+                        "message": f"处理异常: {str(result)}"
                     })
+                else:
+                    processed_results.append(result)
+                    if result["status"] == "success":
+                        batch_uploaded_count += 1
+            
+            batch_results = processed_results
             
             all_results.extend(batch_results)
             total_success += batch_uploaded_count
@@ -540,11 +641,13 @@ async def get_creds_status(token: str = Depends(verify_token)):
         all_credentials = await storage_adapter.list_credentials()
         all_states = await credential_manager.get_creds_status()
         
-        # 读取凭证内容和元数据
-        creds_info = {}
+        # 获取后端信息（一次性获取，避免重复查询）
+        backend_info = await storage_adapter.get_backend_info()
+        backend_type = backend_info.get("backend_type", "unknown")
         
-        # 处理所有凭证，包括那些没有状态记录的
-        for filename in all_credentials:
+        # 并发处理所有凭证的数据获取（状态已获取，无需重复处理）
+        async def process_credential_data(filename):
+            """并发处理单个凭证的数据获取"""
             file_status = all_states.get(filename)
             
             # 如果没有状态记录，创建默认状态
@@ -564,7 +667,7 @@ async def get_creds_status(token: str = Depends(verify_token)):
                     }
                     await storage_adapter.update_credential_state(filename, default_state)
                     file_status = default_state
-                    log.info(f"为凭证 {filename} 创建了默认状态记录")
+                    log.debug(f"为凭证 {filename} 创建了默认状态记录")
                 except Exception as e:
                     log.warning(f"无法为凭证 {filename} 创建状态记录: {e}")
                     # 创建临时状态用于显示
@@ -579,29 +682,29 @@ async def get_creds_status(token: str = Depends(verify_token)):
                         "daily_limit_gemini_2_5_pro": 100,
                         "daily_limit_total": 1000
                     }
+            
             try:
                 # 从存储获取凭证数据
                 credential_data = await storage_adapter.get_credential(filename)
                 if credential_data:
-                    # 获取额外的元数据信息
-                    backend_info = await storage_adapter.get_backend_info()
-                    
-                    creds_info[filename] = {
+                    result = {
                         "status": file_status,
                         "content": credential_data,
                         "filename": os.path.basename(filename),
-                        "backend_type": backend_info.get("backend_type", "unknown"),
+                        "backend_type": backend_type,  # 复用backend信息
                         "user_email": file_status.get("user_email")
                     }
                     
                     # 如果是文件模式，添加文件元数据
-                    if backend_info.get("backend_type") == "file" and os.path.exists(filename):
-                        creds_info[filename].update({
+                    if backend_type == "file" and os.path.exists(filename):
+                        result.update({
                             "size": os.path.getsize(filename),
                             "modified_time": os.path.getmtime(filename)
                         })
+                    
+                    return filename, result
                 else:
-                    creds_info[filename] = {
+                    return filename, {
                         "status": file_status,
                         "content": None,
                         "filename": os.path.basename(filename),
@@ -610,12 +713,26 @@ async def get_creds_status(token: str = Depends(verify_token)):
                     
             except Exception as e:
                 log.error(f"读取凭证文件失败 {filename}: {e}")
-                creds_info[filename] = {
+                return filename, {
                     "status": file_status,
                     "content": None,
                     "filename": os.path.basename(filename),
                     "error": str(e)
                 }
+        
+        # 并发处理所有凭证数据获取
+        log.debug(f"开始并发获取 {len(all_credentials)} 个凭证数据...")
+        concurrent_tasks = [process_credential_data(filename) for filename in all_credentials]
+        results = await asyncio.gather(*concurrent_tasks, return_exceptions=True)
+        
+        # 组装结果
+        creds_info = {}
+        for result in results:
+            if isinstance(result, Exception):
+                log.error(f"处理凭证状态异常: {result}")
+            else:
+                filename, credential_info = result
+                creds_info[filename] = credential_info
         
         return JSONResponse(content={"creds": creds_info})
         
@@ -1056,9 +1173,9 @@ async def save_config(request: ConfigSaveRequest, token: str = Depends(verify_to
         await ensure_credential_manager_initialized()
         new_config = request.config
         
-        log.info(f"收到的配置数据: {list(new_config.keys())}")
-        log.info(f"收到的password值: {new_config.get('password', 'NOT_FOUND')}")
-        
+        log.debug(f"收到的配置数据: {list(new_config.keys())}")
+        log.debug(f"收到的password值: {new_config.get('password', 'NOT_FOUND')}")
+
         # 验证配置项
         if "calls_per_rotation" in new_config:
             if not isinstance(new_config["calls_per_rotation"], int) or new_config["calls_per_rotation"] < 1:
@@ -1163,14 +1280,13 @@ async def save_config(request: ConfigSaveRequest, token: str = Depends(verify_to
             if key not in env_locked_keys:
                 existing_config[key] = value
                 if key == 'password':
-                    log.info(f"设置password字段为: {value}")
+                    log.debug(f"设置password字段为: {value}")
                 elif key == 'api_password':
-                    log.info(f"设置api_password字段为: {value}")
+                    log.debug(f"设置api_password字段为: {value}")
                 elif key == 'panel_password':
-                    log.info(f"设置panel_password字段为: {value}")
-        
-        log.info(f"最终保存的existing_config中password = {existing_config.get('password', 'NOT_FOUND')}")
-        
+                    log.debug(f"设置panel_password字段为: {value}")
+        log.debug(f"最终保存的existing_config中password = {existing_config.get('password', 'NOT_FOUND')}")
+
         # 直接使用存储适配器保存配置
         storage_adapter = await get_storage_adapter()
         for key, value in existing_config.items():
@@ -1180,9 +1296,9 @@ async def save_config(request: ConfigSaveRequest, token: str = Depends(verify_to
         test_api_password = await config.get_api_password()
         test_panel_password = await config.get_panel_password()
         test_password = await config.get_server_password()
-        log.info(f"保存后立即读取的API密码: {test_api_password}")
-        log.info(f"保存后立即读取的面板密码: {test_panel_password}")
-        log.info(f"保存后立即读取的通用密码: {test_password}")
+        log.debug(f"保存后立即读取的API密码: {test_api_password}")
+        log.debug(f"保存后立即读取的面板密码: {test_panel_password}")
+        log.debug(f"保存后立即读取的通用密码: {test_password}")
         
         # 热更新配置到内存中的模块（如果可能）
         hot_updated = []  # 记录成功热更新的配置项

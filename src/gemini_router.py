@@ -189,8 +189,6 @@ async def generate_content(
         log.error("当前无可用凭证，请去控制台获取")
         raise HTTPException(status_code=500, detail="当前无可用凭证，请去控制台获取")
     
-    current_file, credential_data = credential_result
-    
     # 增加调用计数
     cred_mgr.increment_call_count()
     
@@ -236,8 +234,13 @@ async def stream_generate_content(
     log.debug(f"Stream request received for model: {model}")
     log.debug(f"Request headers: {dict(request.headers)}")
     log.debug(f"API key received: {api_key[:10] if api_key else None}...")
-    
-    
+    try:
+        body = await request.body()
+        log.debug(f"request body: {body.decode() if isinstance(body, bytes) else body}")
+    except Exception as e:
+        log.error(f"Failed to read request body: {e}")
+
+
     # 获取原始请求数据
     try:
         request_data = await request.json()
@@ -285,8 +288,6 @@ async def stream_generate_content(
         log.error("当前无可用凭证，请去控制台获取")
         raise HTTPException(status_code=500, detail="当前无可用凭证，请去控制台获取")
     
-    current_file, credential_data = credential_result
-    
     # 增加调用计数
     cred_mgr.increment_call_count()
     
@@ -314,6 +315,51 @@ async def stream_generate_content(
     # 直接返回流式响应
     return response
     
+@router.post("/v1/v1beta/models/{model:path}:countTokens")
+@router.post("/v1/v1/models/{model:path}:countTokens")
+@router.post("/v1beta/models/{model:path}:countTokens")
+@router.post("/v1/models/{model:path}:countTokens")
+async def count_tokens(
+    request: Request = None,
+    api_key: str = Depends(authenticate_gemini_flexible)
+):
+    """模拟Gemini格式的token计数"""
+    
+    try:
+        request_data = await request.json()
+    except Exception as e:
+        log.error(f"Failed to parse JSON request: {e}")
+        raise HTTPException(status_code=400, detail=f"Invalid JSON: {str(e)}")
+    
+    # 简单的token计数模拟 - 基于文本长度估算
+    total_tokens = 0
+    
+    # 如果有contents字段
+    if "contents" in request_data:
+        for content in request_data["contents"]:
+            if "parts" in content:
+                for part in content["parts"]:
+                    if "text" in part:
+                        # 简单估算：大约4字符=1token
+                        text_length = len(part["text"])
+                        total_tokens += max(1, text_length // 4)
+    
+    # 如果有generateContentRequest字段
+    elif "generateContentRequest" in request_data:
+        gen_request = request_data["generateContentRequest"]
+        if "contents" in gen_request:
+            for content in gen_request["contents"]:
+                if "parts" in content:
+                    for part in content["parts"]:
+                        if "text" in part:
+                            text_length = len(part["text"])
+                            total_tokens += max(1, text_length // 4)
+    
+    # 返回Gemini格式的响应
+    return JSONResponse(content={
+        "totalTokens": total_tokens
+    })
+
 @router.get("/v1/v1beta/models/{model:path}")
 @router.get("/v1/v1/models/{model:path}")
 @router.get("/v1beta/models/{model:path}")
@@ -371,8 +417,6 @@ async def fake_stream_response_gemini(request_data: dict, model: str):
                 yield f"data: {json.dumps(error_chunk)}\n\n".encode()
                 yield "data: [DONE]\n\n".encode()
                 return
-            
-            current_file, credential_data = credential_result
             
             # 增加调用计数
             cred_mgr.increment_call_count()

@@ -6,10 +6,9 @@ import os
 from typing import Any, Optional
 
 # Client Configuration
-CLI_VERSION = "0.1.5"  # Match current gemini-cli version
 
 # 需要自动封禁的错误码 (默认值，可通过环境变量或配置覆盖)
-AUTO_BAN_ERROR_CODES = [400, 401, 403]
+AUTO_BAN_ERROR_CODES = [401, 403]
 
 # Default Safety Settings for Google API
 DEFAULT_SAFETY_SETTINGS = [
@@ -77,12 +76,15 @@ async def get_config_value(key: str, default: Any = None, env_var: Optional[str]
     
     # Priority 2: Storage system
     try:
-        from .src.storage_adapter import get_storage_adapter
+        from src.storage_adapter import get_storage_adapter
         storage_adapter = await get_storage_adapter()
         value = await storage_adapter.get_config(key)
+        # 检查值是否存在（不是None），允许空字符串、0、False等有效值
         if value is not None:
             return value
-    except Exception:
+    except Exception as e:
+        # Debug: print import/storage errors
+        # print(f"Config storage error for key {key}: {e}")
         pass
     
     return default
@@ -278,7 +280,7 @@ async def get_api_password() -> str:
     """
     # 优先使用 API_PASSWORD，如果没有则使用通用 PASSWORD 保证兼容性
     api_password = await get_config_value("api_password", None, "API_PASSWORD")
-    if api_password:
+    if api_password is not None:
         return str(api_password)
     
     # 兼容性：使用通用密码
@@ -294,7 +296,7 @@ async def get_panel_password() -> str:
     """
     # 优先使用 PANEL_PASSWORD，如果没有则使用通用 PASSWORD 保证兼容性
     panel_password = await get_config_value("panel_password", None, "PANEL_PASSWORD")
-    if panel_password:
+    if panel_password is not None:
         return str(panel_password)
     
     # 兼容性：使用通用密码
